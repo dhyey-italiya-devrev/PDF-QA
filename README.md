@@ -15,7 +15,7 @@ PDF Question Answering is an AI-powered application that allows users to extract
 
 1. Clone the repository:
 
-git clone https://github.com/flexil/pdf-question-answering.git
+git clone https://github.com/dhyey-italiya-devrev/PDF-QA.git
 
 
 2. Install the required dependencies:
@@ -37,13 +37,4 @@ streamlit run main.py
 2. Upload your PDF file using the provided interface.
 3. Ask a question about the PDF content in the text input field.
 4. The application will display the answer based on the uploaded PDF file.
-5. The session history will be shown below the search bar, and you can clear it by clicking the "Clear" button.
 
-Link to test the app: https://flexil-pdf-question-answering-app-dgc0cy.streamlit.app/
-## Contributing
-
-Contributions are welcome! If you encounter any issues or have suggestions for improvements, please create an issue or submit a pull request.
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).

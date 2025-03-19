@@ -4,7 +4,7 @@
 apt-get install -y tesseract-ocr libtesseract-dev libleptonica-dev
 
 # Install Python packages
-pip3 install pytesseract==0.3.8 pillow==8.4.0
+pip3 install pytesseract pillow
 
 # Make sure the Tesseract OCR executable is in the PATH
 export TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata/
