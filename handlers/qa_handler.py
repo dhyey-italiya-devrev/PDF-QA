@@ -6,7 +6,8 @@ from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.callbacks import get_openai_callback
 from langchain.docstore.document import Document
-from config import TEXT_SPLITTER_CONFIG, CONVERSATION_CONFIG
+from config import TEXT_SPLITTER_CONFIG, CONVERSATION_CONFIG, GROQ_CONFIG
+import tiktoken
 
 class QAHandler:
     def __init__(self, groq_api_key):
@@ -14,6 +15,7 @@ class QAHandler:
         self.setup_embeddings()
         self.vector_store_path = "vector_store"
         os.makedirs(self.vector_store_path, exist_ok=True)
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Used by Mixtral
 
     def setup_embeddings(self):
         model_name = "sentence-transformers/all-mpnet-base-v2"
@@ -25,16 +27,39 @@ class QAHandler:
             encode_kwargs=encode_kwargs
         )
 
-    def _prepare_conversation_documents(self, conversation_history):
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text))
+
+    def truncate_to_token_limit(self, text: str, limit: int) -> str:
+        tokens = self.tokenizer.encode(text)
+        if len(tokens) <= limit:
+            return text
+        return self.tokenizer.decode(tokens[:limit])
+
+    def _prepare_conversation_documents(self, conversation_history, question, knowledge_base):
         if not conversation_history.strip():
             return []
         
-        # Convert conversation history into a document format
-        conv_doc = Document(
-            page_content=conversation_history,
-            metadata={"source": "conversation_history"}
-        )
-        return [conv_doc]
+        # Split conversation history into individual QA pairs
+        qa_pairs = conversation_history.strip().split('\n\n')
+        conv_docs = []
+        
+        for qa_pair in qa_pairs:
+            if not qa_pair.strip():
+                continue
+            conv_doc = Document(
+                page_content=qa_pair,
+                metadata={"source": "conversation_history"}
+            )
+            conv_docs.append(conv_doc)
+        
+        # Get semantic similarity scores for conversation history
+        if conv_docs:
+            scores = knowledge_base.similarity_search_with_score(question, k=len(conv_docs))
+            relevant_docs = [doc for doc, score in scores if score > 0.7]  # Only keep highly relevant history
+            return relevant_docs[:2]  # Limit to 2 most relevant conversation pieces
+        
+        return []
 
     def process_text(self, text, conversation_history=""):
         try:
@@ -81,48 +106,79 @@ class QAHandler:
 
     def get_answer(self, knowledge_base, question, conversation_history):
         try:
-            # First, update vector store with latest conversation context
-            if conversation_history:
-                conv_docs = self._prepare_conversation_documents(conversation_history)
-                if conv_docs:
-                    knowledge_base.add_documents(conv_docs)
-            
-            # Use MMR with source-weighted search
-            docs = knowledge_base.max_marginal_relevance_search(
-                question,
-                k=6,  # Increased to account for conversation context
-                fetch_k=12,
-                lambda_mult=0.7
+            # Calculate stricter token budget
+            max_total = CONVERSATION_CONFIG["max_total_tokens"]
+            question_tokens = self.count_tokens(question)
+            system_prompt_tokens = self.count_tokens(CONVERSATION_CONFIG["system_template"])
+            available_context_tokens = min(
+                CONVERSATION_CONFIG["max_context_tokens"],
+                max_total - question_tokens - system_prompt_tokens - GROQ_CONFIG["token_safety_margin"]
             )
+
+            # Get top-k most relevant documents with scores
+            relevant_docs = knowledge_base.similarity_search_with_score(
+                question,
+                k=GROQ_CONFIG["max_docs_per_query"]
+            )
+
+            # Sort by relevance score and take only the most relevant
+            filtered_docs = sorted(
+                [(doc, score) for doc, score in relevant_docs if score > 0.6],
+                key=lambda x: x[1],
+                reverse=True
+            )
+
+            # Build context within strict token limits
+            current_tokens = 0
+            final_docs = []
+            context_parts = []
+
+            # Add only the most relevant document content that fits
+            for doc, score in filtered_docs:
+                doc_text = doc.page_content
+                doc_tokens = self.count_tokens(doc_text)
+                
+                # If document is too large, truncate it
+                if doc_tokens > available_context_tokens // 2:
+                    doc_text = self.truncate_to_token_limit(doc_text, available_context_tokens // 2)
+                    doc_tokens = self.count_tokens(doc_text)
+                
+                if current_tokens + doc_tokens <= available_context_tokens:
+                    context_parts.append(doc_text)
+                    current_tokens += doc_tokens
+                    final_docs.append(Document(page_content=doc_text, metadata=doc.metadata))
+                else:
+                    break
+
+            context = "\n".join(context_parts)
             
-            # Prioritize recent conversation context
-            context_docs = [doc for doc in docs if doc.metadata.get("source") == "conversation_history"]
-            text_docs = [doc for doc in docs if doc.metadata.get("source") == "main_text"]
-            
-            # Combine context, prioritizing conversation history
-            context = ""
-            if context_docs:
-                context += "\nRecent conversation context:\n" + "\n".join(doc.page_content for doc in context_docs[:2])
-            context += "\nDocument context:\n" + "\n".join(doc.page_content for doc in text_docs[:3])
+            # Only include conversation history if there's room
+            conv_history = ""
+            if conversation_history and current_tokens < available_context_tokens:
+                conv_history = self.truncate_to_token_limit(
+                    conversation_history,
+                    available_context_tokens - current_tokens
+                )
 
             enhanced_question = CONVERSATION_CONFIG["system_template"].format(
-                conversation_history=conversation_history,
+                conversation_history=conv_history,
                 context=context,
                 question=question
             )
 
             llm = ChatGroq(
-                model="mixtral-8x7b-32768", 
+                model="mixtral-8x7b-32768",
                 groq_api_key=self.groq_api_key,
-                temperature=0.3  # Lower temperature for more focused answers
+                temperature=0.3,
+                max_tokens=CONVERSATION_CONFIG["max_response_tokens"]
             )
             
             chain = load_qa_chain(llm, chain_type="stuff")
             
             with get_openai_callback() as cb:
-                response = chain.run(input_documents=docs, question=enhanced_question)
+                response = chain.run(input_documents=final_docs, question=enhanced_question)
 
-            if not response or len(response.strip()) < 10:  # Check for very short answers
+            if not response or len(response.strip()) < 10:
                 return ("I couldn't generate a meaningful answer based on the document content. "
                        "Please try rephrasing your question or ask about something else.")
 
