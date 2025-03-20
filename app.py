@@ -73,6 +73,10 @@ def main():
     if choice in menu_options:
         menu_options[choice]()  # Call the selected function
 
+def display_document_summary():
+    if 'document_summary' in st.session_state:
+        with st.expander("Document Summary", expanded=True):
+            st.markdown(st.session_state['document_summary'])
 
 def upload_pdf():
     st.subheader("Upload your PDF document")
@@ -81,7 +85,6 @@ def upload_pdf():
     if pdf is not None:
         try:
             with st.spinner("Processing PDF..."):
-                # Process PDF in chunks
                 extracted_text = process_pdf(pdf)
                 st.session_state['document_text'] = extracted_text
                 
@@ -89,12 +92,15 @@ def upload_pdf():
                 knowledge_base = st.session_state['qa_handler'].process_text(extracted_text)
                 st.session_state['knowledge_base'] = knowledge_base
                 
-                st.subheader("PDF Extracted Text")
-                st.text(extracted_text[:1000] + "...")  # Show preview
+                # Generate and store summary
+                summary = st.session_state['qa_handler'].summarize_text(extracted_text)
+                st.session_state['document_summary'] = summary
+                
+                # Display summary and start chat
+                display_document_summary()
                 perform_question_answering(extracted_text)
         except ValueError as e:
             st.error(str(e))
-
 
 def upload_word():
     st.subheader("Upload your Word document")
@@ -102,14 +108,22 @@ def upload_word():
 
     if document is not None:
         try:
-            extracted_text = process_docx(document)
-            st.session_state['uploaded_word'] = document
-            st.subheader("Docx Extracted Text")
-            st.text(extracted_text)
-            perform_question_answering(extracted_text)
+            with st.spinner("Processing Word document..."):
+                extracted_text = process_docx(document)
+                st.session_state['document_text'] = extracted_text
+                
+                knowledge_base = st.session_state['qa_handler'].process_text(extracted_text)
+                st.session_state['knowledge_base'] = knowledge_base
+                
+                # Generate and store summary
+                summary = st.session_state['qa_handler'].summarize_text(extracted_text)
+                st.session_state['document_summary'] = summary
+                
+                # Display summary and start chat
+                display_document_summary()
+                perform_question_answering(extracted_text)
         except ValueError as e:
             st.error(str(e))
-
 
 def upload_image():
     st.subheader("Upload your image")
@@ -117,26 +131,37 @@ def upload_image():
 
     if image is not None:
         try:
-            extracted_text = process_image(image)
-            st.session_state['uploaded_image'] = image
-            img = Image.open(image)
-            st.image(img, caption='Uploaded Image', use_column_width=True)
-            st.subheader("Image Extracted Text")
-            st.text(extracted_text)
-            perform_question_answering(extracted_text)
+            with st.spinner("Processing image..."):
+                extracted_text = process_image(image)
+                st.session_state['document_text'] = extracted_text
+                
+                knowledge_base = st.session_state['qa_handler'].process_text(extracted_text)
+                st.session_state['knowledge_base'] = knowledge_base
+                
+                # Display image
+                img = Image.open(image)
+                st.image(img, caption='Uploaded Image', use_column_width=True)
+                
+                # Generate and store summary
+                summary = st.session_state['qa_handler'].summarize_text(extracted_text)
+                st.session_state['document_summary'] = summary
+                
+                # Display summary and start chat
+                display_document_summary()
+                perform_question_answering(extracted_text)
         except ValueError as e:
             st.error(str(e))
-
 
 def init_chat_styles():
     st.markdown("""
         <style>
         .chat-message {
-            padding: 1rem;
+            padding: 1.5rem;
             border-radius: 0.5rem;
             margin-bottom: 1rem;
             display: flex;
             flex-direction: column;
+            max-width: 100%;
         }
         .user-message {
             background-color: #e6f3ff;
@@ -151,22 +176,27 @@ def init_chat_styles():
         .message-timestamp {
             font-size: 0.8rem;
             color: #666666;
-            margin-bottom: 0.3rem;
+            margin-bottom: 0.5rem;
         }
         .message-content {
             margin: 0;
             color: #000000;
             white-space: pre-wrap;
+            word-wrap: break-word;
+            line-height: 1.5;
+            font-size: 1rem;
         }
         </style>
     """, unsafe_allow_html=True)
 
 def display_chat_message(content, is_user=True, timestamp=None):
     message_class = "user-message" if is_user else "bot-message"
+    # Format the content by replacing newlines with HTML line breaks
+    formatted_content = content.replace('\n', '<br>')
     st.markdown(f"""
         <div class="chat-message {message_class}">
             <div class="message-timestamp">{timestamp}</div>
-            <div class="message-content">{content}</div>
+            <div class="message-content">{formatted_content}</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -236,6 +266,7 @@ def clear_session():
     st.session_state.pop('uploaded_pdf', None)
     st.session_state.pop('uploaded_word', None)
     st.session_state.pop('uploaded_image', None)
+    st.session_state.pop('document_summary', None)  # Clear summary
     if os.path.exists("vector_store"):
         import shutil
         shutil.rmtree("vector_store")

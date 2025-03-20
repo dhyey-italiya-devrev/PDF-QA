@@ -36,6 +36,78 @@ class QAHandler:
             return text
         return self.tokenizer.decode(tokens[:limit])
 
+    def _prepare_summary_chunks(self, text):
+        """Prepare text chunks for summarization with token management."""
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=TEXT_SPLITTER_CONFIG["chunk_size"]*2,  # Larger chunks for summary
+            chunk_overlap=TEXT_SPLITTER_CONFIG["chunk_overlap"],
+            length_function=self.count_tokens,
+            separators=["\n\n", "\n", ". ", "! ", "? "]
+        )
+        
+        chunks = text_splitter.split_text(text)
+        processed_chunks = []
+        current_tokens = 0
+        max_tokens = GROQ_CONFIG["max_context_ratio"] * CONVERSATION_CONFIG["max_total_tokens"]
+        
+        for chunk in chunks:
+            chunk_tokens = self.count_tokens(chunk)
+            if current_tokens + chunk_tokens <= max_tokens:
+                processed_chunks.append(chunk)
+                current_tokens += chunk_tokens
+            else:
+                break
+                
+        return processed_chunks
+
+    def summarize_text(self, text):
+        try:
+            llm = ChatGroq(
+                model="mixtral-8x7b-32768",
+                groq_api_key=self.groq_api_key,
+                temperature=0.3,
+                max_tokens=CONVERSATION_CONFIG["max_response_tokens"]
+            )
+            
+            # Process text in chunks
+            chunks = self._prepare_summary_chunks(text)
+            
+            if not chunks:
+                return "Error: Document is too large to process"
+            
+            # For single small documents
+            if len(chunks) == 1 and self.count_tokens(chunks[0]) < 4000:
+                prompt = """Please provide a well-formatted summary of the following document:
+                {}""".format(chunks[0])
+                response = llm.invoke(prompt)
+                return response.content if hasattr(response, 'content') else str(response)
+            
+            # For larger documents, summarize in stages
+            summaries = []
+            for i, chunk in enumerate(chunks):
+                prompt = """Summarize this section of the document:
+                {}""".format(chunk)
+                response = llm.invoke(prompt)
+                summary = response.content if hasattr(response, 'content') else str(response)
+                summaries.append(summary)
+            
+            # Final combined summary if needed
+            if len(summaries) > 1:
+                combined_text = "\n\n".join(summaries)
+                if self.count_tokens(combined_text) > 3000:
+                    combined_text = self.truncate_to_token_limit(combined_text, 3000)
+                
+                final_prompt = """Create a coherent final summary from these section summaries:
+                {}""".format(combined_text)
+                
+                final_response = llm.invoke(final_prompt)
+                return final_response.content if hasattr(final_response, 'content') else str(final_response)
+            
+            return summaries[0]
+            
+        except Exception as e:
+            return f"Error generating summary: {str(e)}"
+
     def _prepare_conversation_documents(self, conversation_history, question, knowledge_base):
         if not conversation_history.strip():
             return []
@@ -106,62 +178,53 @@ class QAHandler:
 
     def get_answer(self, knowledge_base, question, conversation_history):
         try:
-            # Calculate stricter token budget
+            # Calculate token budget
             max_total = CONVERSATION_CONFIG["max_total_tokens"]
             question_tokens = self.count_tokens(question)
-            system_prompt_tokens = self.count_tokens(CONVERSATION_CONFIG["system_template"])
             available_context_tokens = min(
                 CONVERSATION_CONFIG["max_context_tokens"],
-                max_total - question_tokens - system_prompt_tokens - GROQ_CONFIG["token_safety_margin"]
+                max_total - question_tokens - GROQ_CONFIG["token_safety_margin"]
             )
 
-            # Get top-k most relevant documents with scores
+            # Get conversation context first
+            conv_docs = []
+            if conversation_history:
+                conv_docs = self._prepare_conversation_documents(conversation_history, question, knowledge_base)
+
+            # Get and filter main documents
             relevant_docs = knowledge_base.similarity_search_with_score(
                 question,
-                k=GROQ_CONFIG["max_docs_per_query"]
+                k=6
             )
+            filtered_docs = [doc for doc, score in relevant_docs if score > 0.6]
 
-            # Sort by relevance score and take only the most relevant
-            filtered_docs = sorted(
-                [(doc, score) for doc, score in relevant_docs if score > 0.6],
-                key=lambda x: x[1],
-                reverse=True
-            )
-
-            # Build context within strict token limits
+            # Build context within token limits
             current_tokens = 0
             final_docs = []
             context_parts = []
 
-            # Add only the most relevant document content that fits
-            for doc, score in filtered_docs:
-                doc_text = doc.page_content
-                doc_tokens = self.count_tokens(doc_text)
-                
-                # If document is too large, truncate it
-                if doc_tokens > available_context_tokens // 2:
-                    doc_text = self.truncate_to_token_limit(doc_text, available_context_tokens // 2)
-                    doc_tokens = self.count_tokens(doc_text)
-                
+            # Add conversation context if available
+            for doc in conv_docs[:1]:
+                doc_tokens = self.count_tokens(doc.page_content)
                 if current_tokens + doc_tokens <= available_context_tokens:
-                    context_parts.append(doc_text)
+                    context_parts.insert(0, f"Previous relevant context:\n{doc.page_content}")
                     current_tokens += doc_tokens
-                    final_docs.append(Document(page_content=doc_text, metadata=doc.metadata))
+                    final_docs.append(doc)
+
+            # Add document context
+            for doc in filtered_docs:
+                doc_tokens = self.count_tokens(doc.page_content)
+                if current_tokens + doc_tokens <= available_context_tokens:
+                    context_parts.append(doc.page_content)
+                    current_tokens += doc_tokens
+                    final_docs.append(doc)
                 else:
                     break
 
             context = "\n".join(context_parts)
             
-            # Only include conversation history if there's room
-            conv_history = ""
-            if conversation_history and current_tokens < available_context_tokens:
-                conv_history = self.truncate_to_token_limit(
-                    conversation_history,
-                    available_context_tokens - current_tokens
-                )
-
             enhanced_question = CONVERSATION_CONFIG["system_template"].format(
-                conversation_history=conv_history,
+                conversation_history="" if not conv_docs else conv_docs[0].page_content,
                 context=context,
                 question=question
             )
